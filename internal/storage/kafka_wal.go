@@ -10,6 +10,11 @@ type KafkaProducer struct {
 	producer *kafka.Producer
 }
 
+type KafkaConsumer struct {
+	consumer *kafka.Consumer
+	store    Engine
+}
+
 func InitializeKafkaProducer() (*KafkaProducer, error) {
 	p, error := kafka.NewProducer(&kafka.ConfigMap{
 		"bootstrap.servers": "localhost:9092",
@@ -56,12 +61,7 @@ func (p *KafkaProducer) Set(topic, key, value string) error {
 	return nil
 }
 
-type KafkaConsumer struct {
-	consumer *kafka.Consumer
-	store    *MemoryStore
-}
-
-func InitializeKafkaConsumer(m *MemoryStore) (*KafkaConsumer, error) {
+func InitializeKafkaConsumer(m Engine) (*KafkaConsumer, error) {
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
 		"bootstrap.servers": "localhost:9092",
 		"group.id":          "kvsdb-wal-group",
@@ -79,7 +79,22 @@ func InitializeKafkaConsumer(m *MemoryStore) (*KafkaConsumer, error) {
 }
 
 func (k *KafkaConsumer) Subscribe(topic string) error {
-	return k.consumer.SubscribeTopics([]string{topic}, nil)
+	return k.consumer.SubscribeTopics([]string{topic}, func(c *kafka.Consumer, event kafka.Event) error {
+		switch ev := event.(type) {
+		case kafka.AssignedPartitions:
+			for i := range ev.Partitions {
+				pOffset, err := k.store.GetPartitionOffset(ev.Partitions[i].Partition)
+				if err == nil && pOffset >= 0 {
+					ev.Partitions[i].Offset = kafka.Offset(pOffset + 1)
+				}
+			}
+
+			return c.Assign(ev.Partitions)
+		case kafka.RevokedPartitions:
+			return c.Unassign()
+		}
+		return nil
+	})
 }
 
 func (k *KafkaConsumer) Poll() {
@@ -91,7 +106,11 @@ func (k *KafkaConsumer) Poll() {
 			fmt.Println("consumer error:", err)
 			continue
 		}
-		k.store.Set(string(msg.Key), string(msg.Value))
-		fmt.Printf("received: %s\n", string(msg.Value))
+		err = k.store.PutWithOffset(string(msg.Key), string(msg.Value), msg.TopicPartition.Partition, int64(msg.TopicPartition.Offset))
+		if err != nil {
+			fmt.Printf("failed to write to store: %v\n", err)
+			continue
+		}
+		fmt.Printf("received: %s (offset: %d)\n", string(msg.Value), msg.TopicPartition.Offset)
 	}
 }
