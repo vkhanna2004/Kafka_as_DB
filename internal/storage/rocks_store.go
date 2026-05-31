@@ -76,8 +76,11 @@ func (r *RocksStore) PutWithOffset(key, value string, partition int32, offset in
 
 	wb := grocksdb.NewWriteBatch()
 	defer wb.Destroy() // Free C++ memory
-
-	wb.PutCF(r.dataCF, []byte(key), []byte(value))
+	if value != "" {
+		wb.PutCF(r.dataCF, []byte(key), []byte(value))
+	} else {
+		wb.DeleteCF(r.dataCF, []byte(key))
+	}
 
 	partitionKey := fmt.Sprintf("partition_%d_offset", partition)
 

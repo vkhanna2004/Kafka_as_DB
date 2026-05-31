@@ -1,10 +1,9 @@
 package main
 
 import (
-	"fmt"
+	"kvsdb/internal/server"
 	"kvsdb/internal/storage"
 	"log"
-	"time"
 )
 
 func main() {
@@ -20,7 +19,7 @@ func main() {
 		producer.Set("kvsdb-wal", "key1", "msg1")
 		producer.Set("kvsdb-wal", "key2", "msg2")
 		producer.Set("kvsdb-wal", "key3", "msg3")
-		producer.Set("kvsdb-wal", "key1", "msg4")
+		producer.Set("kvsdb-wal", "key1", "")
 	}
 
 	consumer, err2 := storage.InitializeKafkaConsumer(m)
@@ -29,9 +28,11 @@ func main() {
 		go consumer.Poll() //run in background
 	}
 
-	time.Sleep(5 * time.Second)
+	s := server.NewServer(":6379", m, producer)
+	s.Start()
+	// time.Sleep(5 * time.Second)
 
-	fmt.Println("Value for key1 is:", m.Get("key1"))
-	fmt.Println("Value for key2 is:", m.Get("key2"))
+	// fmt.Println("Value for key1 is:", m.Get("key1"))
+	// fmt.Println("Value for key2 is:", m.Get("key2"))
 
 }
