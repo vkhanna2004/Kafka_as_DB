@@ -15,13 +15,15 @@ type Server struct {
 	store    storage.Engine
 	producer *storage.KafkaProducer
 	listener net.Listener
+	walTopic string
 }
 
-func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer) *Server {
+func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, walTopic string) *Server {
 	return &Server{
 		addr:     addr,
 		store:    store,
 		producer: producer,
+		walTopic: walTopic,
 	}
 }
 
@@ -122,8 +124,8 @@ func (s *Server) handleSet(conn net.Conn, cmd *Command) {
 	key := cmd.Args[0]
 	val := cmd.Args[1]
 
-	// CQRS Rule: SET writes strictly to the Kafka WAL first
-	err := s.producer.Set("kvsdb-wal", key, val)
+	// CQRS Rule SET writes strictly to the Kafka WAL first
+	err := s.producer.Set(s.walTopic, key, val)
 	if err != nil {
 		s.writeError(conn, fmt.Sprintf("ERR failed to commit to WAL: %v", err))
 		return
@@ -139,9 +141,15 @@ func (s *Server) handleDel(conn net.Conn, cmd *Command) {
 		return
 	}
 	key := cmd.Args[0]
+	val := s.store.Get(key)
+	if val == "" {
+		// Key does not exist, Return :0\r\n and skip Kafka to prevent WAL bloat
+		conn.Write([]byte(":0\r\n"))
+		return
+	}
 
 	// Tombstone record
-	err := s.producer.Set("kvsdb-wal", key, "")
+	err := s.producer.Set(s.walTopic, key, "")
 	if err != nil {
 		s.writeError(conn, fmt.Sprintf("ERR failed to commit deletion to WAL: %v", err))
 		return

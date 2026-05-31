@@ -15,9 +15,9 @@ type KafkaConsumer struct {
 	store    Engine
 }
 
-func InitializeKafkaProducer() (*KafkaProducer, error) {
+func InitializeKafkaProducer(brokers string) (*KafkaProducer, error) {
 	p, error := kafka.NewProducer(&kafka.ConfigMap{
-		"bootstrap.servers": "localhost:9092",
+		"bootstrap.servers": brokers,
 	})
 	if error != nil {
 		fmt.Printf("Failed to create producer: %s\n", error)
@@ -61,10 +61,10 @@ func (p *KafkaProducer) Set(topic, key, value string) error {
 	return nil
 }
 
-func InitializeKafkaConsumer(m Engine) (*KafkaConsumer, error) {
+func InitializeKafkaConsumer(brokers string, groupID string, m Engine) (*KafkaConsumer, error) {
 	c, err := kafka.NewConsumer(&kafka.ConfigMap{
-		"bootstrap.servers": "localhost:9092",
-		"group.id":          "kvsdb-wal-group",
+		"bootstrap.servers": brokers,
+		"group.id":          groupID,
 		"auto.offset.reset": "earliest",
 	})
 
