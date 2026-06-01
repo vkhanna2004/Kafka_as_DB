@@ -11,6 +11,7 @@ type Engine interface {
 	PutWithOffset(key, val string, partition int32, offset int64) error
 	GetPartitionOffset(partition int32) (int64, error)
 	Close()
+	CreateSnapshot(destDir string) error
 }
 
 type MemoryStore struct {
@@ -22,7 +23,6 @@ func (m *MemoryStore) Get(key string) string {
 	if !ok {
 		fmt.Println("line 21")
 		return ""
-
 	}
 	return value.(string)
 }
@@ -42,4 +42,8 @@ func (m *MemoryStore) GetPartitionOffset(int32) (int64, error) {
 
 func (m *MemoryStore) Close() {
 	// Nothing to close for in-memory store
+}
+
+func (m *MemoryStore) CreateSnapshot(destDir string) error {
+	return nil // no operatioon for in-memory
 }

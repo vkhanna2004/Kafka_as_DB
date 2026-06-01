@@ -8,6 +8,7 @@ type Config struct {
 	RocksDBPath  string
 	ServerAddr   string
 	GroupID      string
+	SnapshotDir  string
 }
 
 // Load reads config from environment or returns sensible defaults
@@ -18,6 +19,7 @@ func Load() *Config {
 		RocksDBPath:  getEnv("ROCKSDB_PATH", "tmp/rocksdb"),
 		ServerAddr:   getEnv("SERVER_ADDR", ":6379"),
 		GroupID:      getEnv("KAFKA_GROUP_ID", "kvsdb-wal-group"),
+		SnapshotDir:  getEnv("SNAPSHOT_DIR", "tmp/snapshots"),
 	}
 }
 

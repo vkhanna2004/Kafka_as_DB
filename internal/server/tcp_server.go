@@ -7,23 +7,28 @@ import (
 	"kvsdb/internal/storage"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Server struct {
-	addr     string
-	store    storage.Engine
-	producer *storage.KafkaProducer
-	listener net.Listener
-	walTopic string
+	addr        string
+	store       storage.Engine
+	producer    *storage.KafkaProducer
+	listener    net.Listener
+	walTopic    string
+	snapshotDir string
 }
 
-func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, walTopic string) *Server {
+func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, walTopic string, snapshotDir string) *Server {
 	return &Server{
-		addr:     addr,
-		store:    store,
-		producer: producer,
-		walTopic: walTopic,
+		addr:        addr,
+		store:       store,
+		producer:    producer,
+		walTopic:    walTopic,
+		snapshotDir: snapshotDir,
 	}
 }
 
@@ -84,6 +89,8 @@ func (s *Server) handleClient(conn net.Conn) {
 			s.handleSet(conn, cmd)
 		case "DEL":
 			s.handleDel(conn, cmd)
+		case "SAVE":
+			s.handleSave(conn, cmd)
 		default:
 			s.writeError(conn, fmt.Sprintf("ERR unknown command '%s'", cmd.Name))
 		}
@@ -157,6 +164,25 @@ func (s *Server) handleDel(conn net.Conn, cmd *Command) {
 
 	// Return 1 indicating 1 key was deleted
 	conn.Write([]byte(":1\r\n"))
+}
+
+func (s *Server) handleSave(conn net.Conn, cmd *Command) {
+	// Ensure the snapshots parent folder exists
+	err1 := os.MkdirAll(s.snapshotDir, 0755)
+	if err1 != nil {
+		s.writeError(conn, fmt.Sprintf("ERR failed to bootstrap snapshots directory: %v", err1))
+		return
+	}
+	unq := "/snapshot_" + strconv.FormatInt(time.Now().UnixMilli(), 10)
+	snapPath := s.snapshotDir + unq
+	err := s.store.CreateSnapshot(snapPath)
+	if err != nil {
+		s.writeError(conn,
+			fmt.Sprintf("ERR failed to create snapshot: %v", err))
+		return
+	}
+
+	conn.Write([]byte("+SNAPSHOT CREATED\r\n"))
 }
 
 // RESP Serialization Helpers

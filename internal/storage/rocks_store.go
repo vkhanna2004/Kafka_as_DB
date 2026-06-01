@@ -118,3 +118,12 @@ func (r *RocksStore) Close() {
 	r.writeOptions.Destroy()
 	r.db.Close()
 }
+
+func (r *RocksStore) CreateSnapshot(destDir string) error {
+	checkpoint, err := r.db.NewCheckpoint()
+	if err != nil {
+		return fmt.Errorf("failed to initialize checkpoint: %w", err)
+	}
+	defer checkpoint.Destroy()
+	return checkpoint.CreateCheckpoint(destDir, 0)
+}
