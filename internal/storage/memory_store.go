@@ -12,6 +12,8 @@ type Engine interface {
 	GetPartitionOffset(partition int32) (int64, error)
 	Close()
 	CreateSnapshot(destDir string) error
+	BeginWrite()
+	EndWrite()
 }
 
 type MemoryStore struct {
@@ -40,9 +42,9 @@ func (m *MemoryStore) GetPartitionOffset(int32) (int64, error) {
 	return -1, nil
 }
 
-func (m *MemoryStore) Close() {
-	// Nothing to close for in-memory store
-}
+func (m *MemoryStore) Close()      {}
+func (m *MemoryStore) BeginWrite() {}
+func (m *MemoryStore) EndWrite()   {}
 
 func (m *MemoryStore) CreateSnapshot(destDir string) error {
 	return nil // no operatioon for in-memory

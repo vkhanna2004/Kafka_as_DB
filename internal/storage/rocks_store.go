@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 
 	"github.com/linxGnu/grocksdb"
 )
@@ -14,6 +15,7 @@ type RocksStore struct {
 	metaCF       *grocksdb.ColumnFamilyHandle
 	readOptions  *grocksdb.ReadOptions
 	writeOptions *grocksdb.WriteOptions
+	mu           sync.RWMutex
 }
 
 func NewRocksStore(path string) (*RocksStore, error) {
@@ -43,6 +45,7 @@ func NewRocksStore(path string) (*RocksStore, error) {
 		metaCF:       handles[1],
 		readOptions:  grocksdb.NewDefaultReadOptions(),
 		writeOptions: grocksdb.NewDefaultWriteOptions(),
+		mu:           sync.RWMutex{},
 	}
 
 	return store, nil
@@ -120,10 +123,19 @@ func (r *RocksStore) Close() {
 }
 
 func (r *RocksStore) CreateSnapshot(destDir string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	checkpoint, err := r.db.NewCheckpoint()
 	if err != nil {
 		return fmt.Errorf("failed to initialize checkpoint: %w", err)
 	}
 	defer checkpoint.Destroy()
 	return checkpoint.CreateCheckpoint(destDir, 0)
+}
+
+func (r *RocksStore) BeginWrite() {
+	r.mu.RLock()
+}
+func (r *RocksStore) EndWrite() {
+	r.mu.RUnlock()
 }

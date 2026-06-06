@@ -26,7 +26,7 @@ func InitializeKafkaProducer(brokers string) (*KafkaProducer, error) {
 	return &KafkaProducer{producer: p}, nil
 }
 
-func (p *KafkaProducer) Set(topic, key, value string) error {
+func (p *KafkaProducer) Set(topic, key, value string) (int32, int64, error) {
 
 	deliveryChan := make(chan kafka.Event)
 
@@ -43,7 +43,7 @@ func (p *KafkaProducer) Set(topic, key, value string) error {
 	)
 
 	if err != nil {
-		return err
+		return -1, -1, err
 	}
 
 	event := <-deliveryChan
@@ -51,14 +51,14 @@ func (p *KafkaProducer) Set(topic, key, value string) error {
 	msg := event.(*kafka.Message)
 
 	if msg.TopicPartition.Error != nil {
-		return msg.TopicPartition.Error
+		return -1, -1, msg.TopicPartition.Error
 	}
 
 	fmt.Println("message delivered successfully")
 
 	close(deliveryChan)
 
-	return nil
+	return msg.TopicPartition.Partition, int64(msg.TopicPartition.Offset), nil
 }
 
 func InitializeKafkaConsumer(brokers string, groupID string, m Engine) (*KafkaConsumer, error) {
@@ -106,7 +106,11 @@ func (k *KafkaConsumer) Poll() {
 			fmt.Println("consumer error:", err)
 			continue
 		}
+
+		k.store.BeginWrite()
 		err = k.store.PutWithOffset(string(msg.Key), string(msg.Value), msg.TopicPartition.Partition, int64(msg.TopicPartition.Offset))
+		k.store.EndWrite()
+
 		if err != nil {
 			fmt.Printf("failed to write to store: %v\n", err)
 			continue

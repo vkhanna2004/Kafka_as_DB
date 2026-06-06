@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,14 @@ type Server struct {
 	listener    net.Listener
 	walTopic    string
 	snapshotDir string
+	cacheMutex  sync.RWMutex
+	rywCache    map[string]cacheEntry
+}
+
+type cacheEntry struct {
+	value     string
+	partition int32
+	offset    int64
 }
 
 func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, walTopic string, snapshotDir string) *Server {
@@ -29,6 +38,7 @@ func NewServer(addr string, store storage.Engine, producer *storage.KafkaProduce
 		producer:    producer,
 		walTopic:    walTopic,
 		snapshotDir: snapshotDir,
+		rywCache:    make(map[string]cacheEntry),
 	}
 }
 
@@ -113,7 +123,28 @@ func (s *Server) handleGet(conn net.Conn, cmd *Command) {
 		return
 	}
 	key := cmd.Args[0]
-	val := s.store.Get(key)
+
+	s.cacheMutex.RLock()
+	entry, found := s.rywCache[key]
+	s.cacheMutex.RUnlock()
+
+	var val string
+	if found {
+		// Get last processed offset from RocksDB for the partition
+		processedOffset, err := s.store.GetPartitionOffset(entry.partition)
+		if err == nil && processedOffset >= entry.offset {
+			s.cacheMutex.Lock()
+			delete(s.rywCache, key)
+			s.cacheMutex.Unlock()
+			val = s.store.Get(key)
+		} else {
+			// Consumer lagging, serve from cache overlay
+			val = entry.value
+		}
+	} else {
+		// key not found, fallback to rocksdb
+		val = s.store.Get(key)
+	}
 
 	// In RocksDB, missing keys return ""
 	if val == "" {
@@ -132,11 +163,19 @@ func (s *Server) handleSet(conn net.Conn, cmd *Command) {
 	val := cmd.Args[1]
 
 	// CQRS Rule SET writes strictly to the Kafka WAL first
-	err := s.producer.Set(s.walTopic, key, val)
+	partition, offset, err := s.producer.Set(s.walTopic, key, val)
+
 	if err != nil {
 		s.writeError(conn, fmt.Sprintf("ERR failed to commit to WAL: %v", err))
 		return
 	}
+	s.cacheMutex.Lock()
+	s.rywCache[key] = cacheEntry{
+		value:     val,
+		partition: partition,
+		offset:    offset,
+	}
+	s.cacheMutex.Unlock()
 
 	// Simple String OK
 	conn.Write([]byte("+OK\r\n"))
@@ -156,12 +195,18 @@ func (s *Server) handleDel(conn net.Conn, cmd *Command) {
 	}
 
 	// Tombstone record
-	err := s.producer.Set(s.walTopic, key, "")
+	partition, offset, err := s.producer.Set(s.walTopic, key, "")
 	if err != nil {
 		s.writeError(conn, fmt.Sprintf("ERR failed to commit deletion to WAL: %v", err))
 		return
 	}
-
+	s.cacheMutex.Lock()
+	s.rywCache[key] = cacheEntry{
+		value:     "",
+		partition: partition,
+		offset:    offset,
+	}
+	s.cacheMutex.Unlock()
 	// Return 1 indicating 1 key was deleted
 	conn.Write([]byte(":1\r\n"))
 }
