@@ -14,6 +14,7 @@ type Engine interface {
 	CreateSnapshot(destDir string) error
 	BeginWrite()
 	EndWrite()
+	GetWithTTL(key string) (string, int64, error)
 }
 
 type MemoryStore struct {
@@ -48,4 +49,12 @@ func (m *MemoryStore) EndWrite()   {}
 
 func (m *MemoryStore) CreateSnapshot(destDir string) error {
 	return nil // no operatioon for in-memory
+}
+
+func (m *MemoryStore) GetWithTTL(key string) (string, int64, error) {
+	val := m.Get(key)
+	if val == "" {
+		return "", 0, nil
+	}
+	return val, 0, nil // MemoryStore has no expiry
 }

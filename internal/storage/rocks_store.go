@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/linxGnu/grocksdb"
 )
@@ -53,7 +55,6 @@ func NewRocksStore(path string) (*RocksStore, error) {
 }
 
 func (r *RocksStore) Get(key string) string {
-
 	slice, err := r.db.GetCF(r.readOptions, r.dataCF, []byte(key))
 	if err != nil {
 		log.Printf("RocksDB Get error: %v", err)
@@ -65,11 +66,19 @@ func (r *RocksStore) Get(key string) string {
 		return ""
 	}
 
-	return string(slice.Data())
+	val, expireAt := UnwrapValue(slice.Data())
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		// Key expired, delete it from disk
+		_ = r.db.DeleteCF(r.writeOptions, r.dataCF, []byte(key))
+		return ""
+	}
+
+	return val
 }
 
 func (r *RocksStore) Set(key, val string) {
-	err := r.db.PutCF(r.writeOptions, r.dataCF, []byte(key), []byte(val))
+	wrapped := WrapValue(val, 0)
+	err := r.db.PutCF(r.writeOptions, r.dataCF, []byte(key), wrapped)
 	if err != nil {
 		log.Printf("RocksDB Set error: %v", err)
 	}
@@ -138,4 +147,36 @@ func (r *RocksStore) BeginWrite() {
 }
 func (r *RocksStore) EndWrite() {
 	r.mu.RUnlock()
+}
+func WrapValue(value string, expireAt int64) []byte {
+	payload := make([]byte, 12+len(value))
+	copy(payload[0:4], []byte("KVS1"))
+	binary.BigEndian.PutUint64(payload[4:12], uint64(expireAt))
+	copy(payload[12:], []byte(value))
+	return payload
+}
+
+func UnwrapValue(data []byte) (string, int64) {
+	if len(data) < 12 || string(data[0:4]) != "KVS1" {
+		return string(data), 0 // Support legacy raw strings (no expiry)
+	}
+	expireAt := int64(binary.BigEndian.Uint64(data[4:12]))
+	return string(data[12:]), expireAt
+}
+
+func (r *RocksStore) GetWithTTL(key string) (string, int64, error) {
+	slice, err := r.db.GetCF(r.readOptions, r.dataCF, []byte(key))
+	if err != nil {
+		return "", 0, err
+	}
+	defer slice.Free()
+	if !slice.Exists() {
+		return "", 0, nil
+	}
+	val, expireAt := UnwrapValue(slice.Data())
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		_ = r.db.DeleteCF(r.writeOptions, r.dataCF, []byte(key))
+		return "", 0, nil
+	}
+	return val, expireAt, nil
 }
