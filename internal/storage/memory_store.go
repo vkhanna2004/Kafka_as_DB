@@ -15,6 +15,7 @@ type Engine interface {
 	BeginWrite()
 	EndWrite()
 	GetWithTTL(key string) (string, int64, error)
+	MultiGet(keys []string) []string
 }
 
 type MemoryStore struct {
@@ -57,4 +58,16 @@ func (m *MemoryStore) GetWithTTL(key string) (string, int64, error) {
 		return "", 0, nil
 	}
 	return val, 0, nil // MemoryStore has no expiry
+}
+
+func (m *MemoryStore) MultiGet(keys []string) []string {
+	values := make([]string, len(keys))
+	for i, key := range keys {
+		if value, ok := m.data.Load(key); ok {
+			values[i] = value.(string)
+		} else {
+			values[i] = ""
+		}
+	}
+	return values
 }

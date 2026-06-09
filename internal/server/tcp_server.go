@@ -106,6 +106,8 @@ func (s *Server) handleClient(conn net.Conn) {
 			s.handleExpire(conn, cmd)
 		case "TTL":
 			s.handleTtl(conn, cmd)
+		case "MGET":
+			s.handleMultiGet(conn, cmd)
 		default:
 			s.writeError(conn, fmt.Sprintf("ERR unknown command '%s'", cmd.Name))
 		}
@@ -165,6 +167,70 @@ func (s *Server) handleGet(conn net.Conn, cmd *Command) {
 	}
 }
 
+func (s *Server) handleMultiGet(conn net.Conn, cmd *Command) {
+	if len(cmd.Args) == 0 {
+		s.writeError(conn, "ERR wrong number of arguments for 'mget' command")
+		return
+	}
+	if len(cmd.Args) > 1000 {
+		s.writeError(conn, "ERR MGET limit exceeded (maximum 1000 keys)")
+		return
+	}
+
+	values := make([]string, len(cmd.Args))
+	var rocksKeys []string
+	var rocksIndices []int
+
+	for i, key := range cmd.Args {
+		s.cacheMutex.RLock()
+		entry, found := s.rywCache[key]
+		s.cacheMutex.RUnlock()
+
+		if found {
+			if entry.expireAt > 0 && time.Now().UnixNano() > entry.expireAt {
+				s.cacheMutex.Lock()
+				delete(s.rywCache, key)
+				s.cacheMutex.Unlock()
+				values[i] = ""
+			} else if entry.value == "" {
+				values[i] = ""
+			} else {
+				processedOffset, err := s.store.GetPartitionOffset(entry.partition)
+				if err == nil && processedOffset >= entry.offset {
+					s.cacheMutex.Lock()
+					delete(s.rywCache, key)
+					s.cacheMutex.Unlock()
+					rocksKeys = append(rocksKeys, key)
+					rocksIndices = append(rocksIndices, i)
+				} else {
+					values[i] = entry.value
+				}
+			}
+		} else {
+			rocksKeys = append(rocksKeys, key)
+			rocksIndices = append(rocksIndices, i)
+		}
+	}
+
+	if len(rocksKeys) > 0 {
+		rocksValues := s.store.MultiGet(rocksKeys)
+		for idx, val := range rocksValues {
+			origIdx := rocksIndices[idx]
+			values[origIdx] = val
+		}
+	}
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(values)))
+	for _, val := range values {
+		if val == "" {
+			builder.WriteString("$-1\r\n")
+		} else {
+			builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(val), val))
+		}
+	}
+	conn.Write([]byte(builder.String()))
+}
 func (s *Server) handleSet(conn net.Conn, cmd *Command) {
 	if len(cmd.Args) != 2 {
 		s.writeError(conn, "ERR wrong number of arguments for 'set' command")

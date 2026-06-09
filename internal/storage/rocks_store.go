@@ -180,3 +180,38 @@ func (r *RocksStore) GetWithTTL(key string) (string, int64, error) {
 	}
 	return val, expireAt, nil
 }
+
+func (r *RocksStore) MultiGet(keys []string) []string {
+	byteKeys := make([][]byte, len(keys))
+
+	for i, k := range keys {
+		byteKeys[i] = []byte(k)
+	}
+	slices, err := r.db.MultiGetCF(r.readOptions, r.dataCF, byteKeys...)
+	if err != nil {
+		log.Printf("RocksDB Get error: %v", err)
+		return []string{}
+	}
+	defer slices.Destroy() // Free C++ memory
+
+	if len(slices) == 0 {
+		return []string{}
+	}
+
+	var ans []string
+	for i, slice := range slices {
+		if slice == nil {
+			ans = append(ans, "")
+			continue
+		}
+		val, expireAt := UnwrapValue(slice.Data())
+		if expireAt > 0 && time.Now().UnixNano() > expireAt {
+			// Key expired, delete it from disk
+			_ = r.db.DeleteCF(r.writeOptions, r.dataCF, []byte(keys[i]))
+			ans = append(ans, "")
+			continue
+		}
+		ans = append(ans, val)
+	}
+	return ans
+}
