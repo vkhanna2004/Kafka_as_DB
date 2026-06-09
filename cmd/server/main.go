@@ -119,7 +119,7 @@ func main() {
 		go consumer.Poll() // run in background
 	}
 
-	s := server.NewServer(cfg.ServerAddr, m, producer, cfg.WalTopic, cfg.SnapshotDir)
+	s := server.NewServer(cfg.ServerAddr, m, producer, consumer, cfg.WalTopic, cfg.SnapshotDir)
 	if err := s.Start(); err != nil {
 		log.Fatalf("Server exited with error: %v", err)
 	}

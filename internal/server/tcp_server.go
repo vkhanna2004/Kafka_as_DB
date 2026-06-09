@@ -2,27 +2,32 @@ package server
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"kvsdb/internal/storage"
 	"log"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Server struct {
-	addr        string
-	store       storage.Engine
-	producer    *storage.KafkaProducer
-	listener    net.Listener
-	walTopic    string
-	snapshotDir string
-	cacheMutex  sync.RWMutex
-	rywCache    map[string]cacheEntry
+	addr              string
+	store             storage.Engine
+	producer          *storage.KafkaProducer
+	consumer          *storage.KafkaConsumer
+	listener          net.Listener
+	walTopic          string
+	snapshotDir       string
+	cacheMutex        sync.RWMutex
+	rywCache          map[string]cacheEntry
+	activeConnections int64
 }
 
 type cacheEntry struct {
@@ -32,11 +37,12 @@ type cacheEntry struct {
 	expireAt  int64
 }
 
-func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, walTopic string, snapshotDir string) *Server {
+func NewServer(addr string, store storage.Engine, producer *storage.KafkaProducer, consumer *storage.KafkaConsumer, walTopic string, snapshotDir string) *Server {
 	return &Server{
 		addr:        addr,
 		store:       store,
 		producer:    producer,
+		consumer:    consumer,
 		walTopic:    walTopic,
 		snapshotDir: snapshotDir,
 		rywCache:    make(map[string]cacheEntry),
@@ -71,6 +77,8 @@ func (s *Server) Close() {
 
 // handles the lifecycle of a single TCP client connection
 func (s *Server) handleClient(conn net.Conn) {
+	atomic.AddInt64(&s.activeConnections, 1)
+	defer atomic.AddInt64(&s.activeConnections, -1)
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
@@ -108,6 +116,12 @@ func (s *Server) handleClient(conn net.Conn) {
 			s.handleTtl(conn, cmd)
 		case "MGET":
 			s.handleMultiGet(conn, cmd)
+		case "MSET":
+			s.handleMultiSet(conn, cmd)
+		case "SCAN":
+			s.handleScan(conn, cmd)
+		case "INFO":
+			s.handleInfo(conn, cmd)
 		default:
 			s.writeError(conn, fmt.Sprintf("ERR unknown command '%s'", cmd.Name))
 		}
@@ -231,6 +245,7 @@ func (s *Server) handleMultiGet(conn net.Conn, cmd *Command) {
 	}
 	conn.Write([]byte(builder.String()))
 }
+
 func (s *Server) handleSet(conn net.Conn, cmd *Command) {
 	if len(cmd.Args) != 2 {
 		s.writeError(conn, "ERR wrong number of arguments for 'set' command")
@@ -257,6 +272,53 @@ func (s *Server) handleSet(conn net.Conn, cmd *Command) {
 	s.cacheMutex.Unlock()
 
 	// Simple String OK
+	conn.Write([]byte("+OK\r\n"))
+}
+
+func (s *Server) handleMultiSet(conn net.Conn, cmd *Command) {
+	// MSET arguments must be paired
+	if len(cmd.Args) == 0 || len(cmd.Args)%2 != 0 {
+		s.writeError(conn, "ERR wrong number of arguments for 'mset' command")
+		return
+	}
+
+	// Pack arguments into Mutation list
+	numMutations := len(cmd.Args) / 2
+	mutations := make([]storage.Mutation, numMutations)
+	for i := 0; i < len(cmd.Args); i += 2 {
+		mutations[i/2] = storage.Mutation{
+			Key: cmd.Args[i],
+			Val: cmd.Args[i+1],
+		}
+	}
+
+	// Serialize list to JSON and prefix with identifier
+	jsonBytes, err := json.Marshal(mutations)
+	if err != nil {
+		s.writeError(conn, fmt.Sprintf("ERR failed to marshal MSET payload: %v", err))
+		return
+	}
+	batchPayload := "MSET_BATCH:" + string(jsonBytes)
+
+	// Using first key in the batch as the partition routing key
+	routingKey := mutations[0].Key
+	partition, offset, err := s.producer.Set(s.walTopic, routingKey, batchPayload)
+	if err != nil {
+		s.writeError(conn, fmt.Sprintf("ERR failed to commit MSET to WAL: %v", err))
+		return
+	}
+
+	s.cacheMutex.Lock()
+	for _, m := range mutations {
+		s.rywCache[m.Key] = cacheEntry{
+			value:     m.Val,
+			partition: partition,
+			offset:    offset,
+			expireAt:  0,
+		}
+	}
+	s.cacheMutex.Unlock()
+
 	conn.Write([]byte("+OK\r\n"))
 }
 
@@ -432,6 +494,63 @@ func (s *Server) handleTtl(conn net.Conn, cmd *Command) {
 	}
 }
 
+func (s *Server) handleScan(conn net.Conn, cmd *Command) {
+	if len(cmd.Args) < 1 {
+		s.writeError(conn, "ERR wrong number of arguments for 'scan' command")
+		return
+	}
+
+	cursor := cmd.Args[0]
+	if cursor == "0" {
+		cursor = ""
+	}
+
+	prefix := ""
+	count := 10
+
+	// Parse optional parameters MATCH <prefix> and COUNT <count>
+	for i := 1; i < len(cmd.Args); i++ {
+		arg := strings.ToUpper(cmd.Args[i])
+		if arg == "MATCH" && i+1 < len(cmd.Args) {
+			prefix = cmd.Args[i+1]
+			i++
+		} else if arg == "COUNT" && i+1 < len(cmd.Args) {
+			c, err := strconv.Atoi(cmd.Args[i+1])
+			if err == nil && c > 0 {
+				count = c
+			}
+			i++
+		}
+	}
+
+	keys, nextCursor, err := s.store.Scan(prefix, cursor, count)
+	if err != nil {
+		s.writeError(conn, fmt.Sprintf("ERR scan failed: %v", err))
+		return
+	}
+
+	if nextCursor == "" {
+		nextCursor = "0"
+	}
+
+	// RESP format for SCAN returns an array containing:
+	// 1. The next cursor string
+	// 2. An array of keys
+	var builder strings.Builder
+	builder.WriteString("*2\r\n") // Main wrapper array
+
+	// Write the next cursor
+	builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(nextCursor), nextCursor))
+
+	// Write the array of matched keys
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(keys)))
+	for _, k := range keys {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(k), k))
+	}
+
+	conn.Write([]byte(builder.String()))
+}
+
 // RESP Serialization Helpers
 
 func (s *Server) writeBulkString(conn net.Conn, val string) {
@@ -442,4 +561,69 @@ func (s *Server) writeBulkString(conn net.Conn, val string) {
 func (s *Server) writeError(conn net.Conn, msg string) {
 	resp := fmt.Sprintf("-%s\r\n", msg)
 	conn.Write([]byte(resp))
+}
+
+func (s *Server) handleInfo(conn net.Conn, cmd *Command) {
+	var builder strings.Builder
+
+	// Server Metadata
+	builder.WriteString("# Server\r\n")
+	builder.WriteString("kvsdb_version:1.0.0\r\n")
+	builder.WriteString("os:linux\r\n")
+	builder.WriteString(fmt.Sprintf("tcp_port:%s\r\n", s.addr))
+	builder.WriteString("\r\n")
+
+	// Clients Metadata
+	builder.WriteString("# Clients\r\n")
+	builder.WriteString(fmt.Sprintf("connected_clients:%d\r\n", atomic.LoadInt64(&s.activeConnections)))
+	builder.WriteString("\r\n")
+
+	// Memory Metadata
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	builder.WriteString("# Memory\r\n")
+	builder.WriteString(fmt.Sprintf("used_memory:%d\r\n", m.Alloc))
+	builder.WriteString(fmt.Sprintf("total_system_memory:%d\r\n", m.Sys))
+	builder.WriteString(fmt.Sprintf("gc_cycles:%d\r\n", m.NumGC))
+	builder.WriteString("\r\n")
+
+	// Persistence / RocksDB Metadata
+	builder.WriteString("# Persistence\r\n")
+	liveDataSize := s.store.GetProperty("rocksdb.estimate-live-data-size")
+	if liveDataSize == "" {
+		liveDataSize = "0"
+	}
+	numSstFiles := s.store.GetProperty("rocksdb.num-files-at-level0")
+	if numSstFiles == "" {
+		numSstFiles = "0"
+	}
+	builder.WriteString(fmt.Sprintf("rocksdb_live_data_size_bytes:%s\r\n", liveDataSize))
+	builder.WriteString(fmt.Sprintf("rocksdb_num_files_level0:%s\r\n", numSstFiles))
+	builder.WriteString("\r\n")
+
+	// Kafka Sync Lag Stats
+	builder.WriteString("# Kafka\r\n")
+	if s.consumer != nil {
+		committed, high, err := s.consumer.GetLag(s.walTopic)
+		if err == nil {
+			for part, committedOffset := range committed {
+				highOffset, ok := high[part]
+				lag := int64(0)
+				if ok {
+					lag = highOffset - committedOffset - 1
+					if lag < 0 {
+						lag = 0
+					}
+				}
+				builder.WriteString(fmt.Sprintf("partition_%d_committed_offset:%d\r\n", part, committedOffset))
+				if ok {
+					builder.WriteString(fmt.Sprintf("partition_%d_high_watermark:%d\r\n", part, highOffset))
+					builder.WriteString(fmt.Sprintf("partition_%d_lag:%d\r\n", part, lag))
+				}
+			}
+		}
+	}
+	builder.WriteString("\r\n")
+
+	s.writeBulkString(conn, builder.String())
 }

@@ -118,3 +118,29 @@ func (k *KafkaConsumer) Poll() {
 		fmt.Printf("received: %s (offset: %d)\n", string(msg.Value), msg.TopicPartition.Offset)
 	}
 }
+
+func (k *KafkaConsumer) GetLag(topic string) (map[int32]int64, map[int32]int64, error) {
+	partitions, err := k.consumer.Assignment()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	highWatermarks := make(map[int32]int64)
+	committedOffsets := make(map[int32]int64)
+
+	for _, tp := range partitions {
+		if tp.Topic != nil && *tp.Topic == topic {
+			_, high, err := k.consumer.QueryWatermarkOffsets(topic, tp.Partition, 500)
+			if err == nil {
+				highWatermarks[tp.Partition] = high
+			}
+
+			localOffset, err := k.store.GetPartitionOffset(tp.Partition)
+			if err == nil {
+				committedOffsets[tp.Partition] = localOffset
+			}
+		}
+	}
+
+	return committedOffsets, highWatermarks, nil
+}
